@@ -1,0 +1,59 @@
+if (nchar(Sys.getenv("SPARK_HOME")) < 1) {
+  Sys.setenv(SPARK_HOME = "/opt/spark")
+}
+
+library(SparkR)
+
+consulta <- "from_json(lower(value),'timestamp Timestamp, devid STRING, tipo STRING, srcip STRING,
+              dstport STRING, applist STRING, sentpkt INT, duration INT, devname STRING,
+              dstip STRING, group STRING, utmaction STRING, sentbyte INT, appcat STRING,
+              srcport STRING, user STRING, rcvdbyte INT, rcvdpkt INT
+              ') as value"
+
+sparkR.session(appName = "sparkkafka-teste",
+               sparkPackages = c("org.apache.spark:spark-sql-kafka-0-10_2.11:2.3.0",
+                                 "org.apache.kafka:kafka-clients:1.1.0"),
+               sparkConfig = list(spark.sql.streaming.checkpointLocation="true",
+                                  spark.speculation="true",spark.task.maxFailures=8,
+                                  spark.yarn.executor.failuresValidityInterval="1h",
+                                  spark.yarn.max.executor.failures=1000,
+                                  spark.yarn.am.attemptFailuresValidityInterval="1h",
+                                  spark.yarn.maxAppAttempts=4
+                                  )
+               )
+
+lines <- read.stream(source="kafka", subscribe="fortinet",kafka.bootstrap.servers="localhost:9092")
+#lines <- read.stream("socket", host = "localhost", port = 9515)
+
+saida <- lines
+
+printSchema(saida)
+
+words <- selectExpr(lines, consulta)
+values <- select(words, "value.*")
+values <- withWatermark(values, "timestamp", "1 minute")
+isStreaming(values)
+printSchema(values)
+
+#teste <- agg(cube(values,"srcip","sentbyte","rcvdbyte","sentpkt","rcvdpkt","duration","group"),avg(values$duration))
+teste <- agg(groupBy(values, window(values$timestamp,"1 minute"),values$srcip,values$dstip),
+             sentbyte=sum(values$sentbyte),rcvdbyte=sum(values$rcvdbyte),qtd = n(values$timestamp)
+             )
+#teste <- selectExpr(teste,"to_json(window,srcip,dstip,sentbyte,rcvdbyte,qtd)")
+#teste <- selectExpr(teste,'to_json(map("window",window),map("srcip",srcip)) as value')
+teste <- selectExpr(teste,'to_json(named_struct("window",window,"srcip",srcip,
+                    "dstip",dstip,"sentbyte",sentbyte,"rcvdbyte",rcvdbyte,"qtd",qtd)) as value')
+#teste <- filter(teste,teste$dstip!=NULL)
+#isStreaming(teste)
+
+printSchema(teste)
+
+#query <- write.stream(teste, "console", outputMode = "update",trigger.processingTime="1 minute", numRows=200)
+query <- write.stream(teste, "kafka", topic="test",kafka.bootstrap.servers="localhost:9092",
+                      outputMode = "update",format="kafka", trigger.processingTime="1 minute")
+#query <- write.stream(values, "json", path = "/tmp/out", checkpointLocation = "/tmp/cp")
+
+awaitTermination(query)
+
+sparkR.session.stop()
+sparkR.stop()
